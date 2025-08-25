@@ -92,6 +92,7 @@ def main():
     ap.add_argument("--since", default="", help="Override start (YYYY-MM-DD or ISO). If omitted, auto-resume.")
     ap.add_argument("--until", default="", help="End (YYYY-MM-DD or ISO). Default = now")
     ap.add_argument("--filename", default="", help="Optional output filename. Default is auto.")
+    ap.add_argument("--forwarder-path", default=None,help="Path to forward_new.py (default: one level up from this script)")
     ap.add_argument("--max-attach-mb", type=float, default=7.8, help="Pass-through to forward_new.py")
     ap.add_argument("--max-files-per-post", type=int, default=8, help="Pass-through to forward_new.py")
     ap.add_argument("--edge-overlap-seconds", type=int, default=60,
@@ -104,6 +105,8 @@ def main():
     exporter = Path(args.exporter_path)
     if not exporter.exists():
         print(f"[error] Exporter not found at: {exporter}", file=sys.stderr); sys.exit(2)
+
+    forwarder_py = Path(args.forwarder_path) if args.forwarder_path else Path(__file__).with_name("forward_once.py")
 
     # ---- Determine effective window
     # UNTIL: default now
@@ -186,8 +189,7 @@ def main():
     fwd_idmap = state_dir / f"id_map_{args.channel}.json"  # keep if your script supports --id-map
 
     fwd_cmd = [
-        sys.executable,  # python
-        "forward_new.py",
+        sys.executable,  str(forwarder_py),
         "--webhook", args.webhook,
         "--json", str(out_path),        # <- was --input
         "--state", str(fwd_state),      # <- REQUIRED by your forwarder

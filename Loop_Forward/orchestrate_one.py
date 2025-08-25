@@ -76,7 +76,7 @@ def main():
     log_path = Path(args.log) if args.log else (export_dir / "channel.log")
 
     # forwarder path
-    forwarder_py = Path(args.forwarder_path) if args.forwarder_path else Path(__file__).with_name("forward_new.py")
+    forwarder_py = Path(args.forwarder_path) if args.forwarder_path else Path(__file__).with_name("forward_loop.py")
 
     # progress & targets
     progress = load_progress(progress_path)
