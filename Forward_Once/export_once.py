@@ -1,23 +1,33 @@
-# export_once.py
-import argparse, json, os, sys, glob, subprocess, datetime
+#!/usr/bin/env python3
+"""
+Export a window with DiscordChatExporter and immediately forward it with forward_once.py.
+- Auto-resume using per-channel state
+- Edge overlap window to avoid boundary misses (dedupe in forwarder)
+- Pass-through of upload size caps / file batch size
+- Verbose logging & dry-run support
+"""
+
+import argparse
+import datetime
+import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
-# ---------- Helpers ----------
 def iso(dt: datetime.datetime) -> str:
     if dt.tzinfo is None:
-        return dt.replace(tzinfo=datetime.timezone.utc).isoformat()
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
     return dt.isoformat()
 
 def parse_iso(s: str) -> datetime.datetime:
-    # Accept plain date or ISO with/without timezone
     s = s.strip()
     try:
         if len(s) == 10 and s[4] == "-" and s[7] == "-":
-            # YYYY-MM-DD -> midnight local naive
             return datetime.datetime.fromisoformat(s + "T00:00:00")
         return datetime.datetime.fromisoformat(s)
     except Exception:
-        raise ValueError(f"Invalid ISO/date string: {s}")
+        raise ValueError(f"Invalid date/ISO string: {s}")
 
 def read_json(path: Path):
     with path.open("r", encoding="utf-8") as f:
@@ -36,14 +46,13 @@ def find_latest_msg_ts_in_export(file_path: Path) -> datetime.datetime | None:
         msgs = data.get("messages") if isinstance(data, dict) else data
         if not isinstance(msgs, list) or not msgs:
             return None
-        # messages from DiscordChatExporter have 'timestamp' as ISO
         latest = None
         for m in msgs:
-            ts = m.get("timestamp")
+            ts = m.get("timestamp") or m.get("Timestamp") or m.get("timestampISO")
             if not ts:
                 continue
             try:
-                dt = parse_iso(ts)
+                dt = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
             except Exception:
                 continue
             latest = dt if latest is None else max(latest, dt)
@@ -52,14 +61,8 @@ def find_latest_msg_ts_in_export(file_path: Path) -> datetime.datetime | None:
         return None
 
 def scan_exports_for_latest(channel_id: str, export_dir: Path) -> datetime.datetime | None:
-    # Look for any JSONs that contain this channel (by filename convention or all jsons)
-    candidates = []
-    for p in export_dir.glob("*.json"):
-        name = p.name.lower()
-        if channel_id in name or True:
-            candidates.append(p)
     best = None
-    for p in candidates:
+    for p in export_dir.glob("*.json"):
         dt = find_latest_msg_ts_in_export(p)
         if dt:
             best = dt if best is None else max(best, dt)
@@ -76,27 +79,31 @@ def load_state(state_dir: Path, channel_id: str) -> dict:
 
 def save_state(state_dir: Path, channel_id: str, last_exported_iso: str):
     p = state_dir / f"channel_{channel_id}.json"
-    state = {"channel_id": channel_id, "last_exported_iso": last_exported_iso}
-    write_json(p, state)
+    write_json(p, {"last_exported_iso": last_exported_iso})
 
-# ---------- Core ----------
 def main():
-    ap = argparse.ArgumentParser(description="Export once & forward for one channel with resume-by-date.")
-    ap.add_argument("--channel", required=True, help="Discord channel ID")
-    ap.add_argument("--webhook", required=True, help="Destination webhook URL")
-    ap.add_argument("--token", required=True, help="Discord user/bot token for exporter")
-    ap.add_argument("--export-dir", default="exports", help="Folder to write JSON export")
+    ap = argparse.ArgumentParser(description="Export once and forward.")
+    ap.add_argument("--token", required=True, help="Discord token for DiscordChatExporter")
+    ap.add_argument("--channel", required=True, help="Channel ID to export")
+    ap.add_argument("--guild", default="", help="Optional Guild ID (for nicer file name)")
+    ap.add_argument("--webhook", required=True, help="Destination Discord webhook")
+
+    ap.add_argument("--export-dir", default="exports", help="Where to save exporter JSON")
     ap.add_argument("--state-dir", default="state", help="Folder to store per-channel resume state")
     ap.add_argument("--exporter-path", default=r".\DiscordChatExporter.Cli.exe",
                     help="Path to DiscordChatExporter.Cli.exe")
+    ap.add_argument("--forwarder-path", default="", help="Path to forward_once.py (default: alongside this script)")
+
     ap.add_argument("--since", default="", help="Override start (YYYY-MM-DD or ISO). If omitted, auto-resume.")
     ap.add_argument("--until", default="", help="End (YYYY-MM-DD or ISO). Default = now")
-    ap.add_argument("--filename", default="", help="Optional output filename. Default is auto.")
-    ap.add_argument("--forwarder-path", default=None,help="Path to forward_new.py (default: one level up from this script)")
-    ap.add_argument("--max-attach-mb", type=float, default=7.8, help="Pass-through to forward_new.py")
-    ap.add_argument("--max-files-per-post", type=int, default=8, help="Pass-through to forward_new.py")
     ap.add_argument("--edge-overlap-seconds", type=int, default=60,
-                help="Expand export window on both sides to avoid boundary misses (dedupe in forwarder prevents dupes).")
+                    help="Expand export window on both sides to avoid boundary misses.")
+
+    # Forwarding passthrough
+    ap.add_argument("--max-attach-mb", type=float, default=7.8, help="Max per-file upload size")
+    ap.add_argument("--max-files-per-post", type=int, default=8, help="Max files per webhook post (<=10)")
+    ap.add_argument("--dry-run", action="store_true", help="Forwarder dry-run (export still runs)")
+    ap.add_argument("--verbose", action="store_true", help="Verbose logging")
 
     args = ap.parse_args()
 
@@ -108,111 +115,106 @@ def main():
 
     forwarder_py = Path(args.forwarder_path) if args.forwarder_path else Path(__file__).with_name("forward_once.py")
 
-    # ---- Determine effective window
-    # UNTIL: default now
-    if args.until:
-        until_dt = parse_iso(args.until)
-    else:
-        until_dt = datetime.datetime.now(datetime.timezone.utc)
-
-    # SINCE: explicit > state > scan
-    since_dt = None
+    # Determine window
+    until_dt = parse_iso(args.until) if args.until else datetime.datetime.now(datetime.timezone.utc)
+    since_dt: datetime.datetime
     if args.since:
         since_dt = parse_iso(args.since)
     else:
-        state = load_state(state_dir, args.channel)
-        last_iso = state.get("last_exported_iso")
+        st = load_state(state_dir, args.channel)
+        last_iso = st.get("last_exported_iso")
         if last_iso:
             try:
-                since_dt = parse_iso(last_iso) + datetime.timedelta(seconds=1)
+                since_dt = datetime.datetime.fromisoformat(last_iso)
             except Exception:
                 since_dt = None
-        if since_dt is None:
-            scanned = scan_exports_for_latest(args.channel, export_dir)
-            if scanned:
-                since_dt = scanned + datetime.timedelta(seconds=1)
+        else:
+            since_dt = None
 
-    OVERLAP = datetime.timedelta(seconds=args.edge_overlap_seconds)
-    if since_dt:
-        since_dt = since_dt - OVERLAP
-    if until_dt:
-        until_dt = until_dt + OVERLAP
+        if not since_dt:
+            guess = scan_exports_for_latest(args.channel, export_dir)
+            if guess:
+                since_dt = guess
+            else:
+                # default: 14 days lookback on first run (safe)
+                since_dt = until_dt - datetime.timedelta(days=14)
 
-    # If still None, let exporter pull full history unless user gave a since; recommend setting one for inactive channels
-    since_arg = []
-    if since_dt:
-        since_arg = ["--after", iso(since_dt)]
+    # Apply overlap
+    overlap = datetime.timedelta(seconds=max(0, args.edge_overlap_seconds))
+    since_eff = since_dt - overlap
+    until_eff = until_dt + overlap
 
-    until_arg = []
-    if until_dt:
-        until_arg = ["--before", iso(until_dt)]
+    # Build filename
+    guild_part = f"{args.guild}_" if args.guild else ""
+    out_name = f"{guild_part}{args.channel}_{since_eff.strftime('%Y%m%dT%H%M%S')}_{until_eff.strftime('%Y%m%dT%H%M%S')}.json"
+    out_path = export_dir / out_name
 
-    # ---- Compose output filename
-    if args.filename:
-        out_path = export_dir / args.filename
-    else:
-        # channel_<id>__after_<...>__before_<...>.json
-        s_label = (since_dt.isoformat().replace(":", "-") if since_dt else "start")
-        u_label = until_dt.isoformat().replace(":", "-")
-        out_path = export_dir / f"channel_{args.channel}__after_{s_label}__before_{u_label}.json"
+    if args.verbose:
+        print(f"[info] Exporting: channel={args.channel} since={since_eff.isoformat()} until={until_eff.isoformat()}")
+        print(f"[info] -> {out_path}")
 
-    # ---- Run exporter
-    export_cmd = [
+    # Run exporter
+    # DiscordChatExporter CLI typical args:
+    # DiscordChatExporter.Cli.exe export -t <token> -c <channel> -f Json -o <file> --after <iso> --before <iso>
+    cmd = [
         str(exporter),
         "export",
+        "-t", args.token,
         "-c", args.channel,
         "-f", "Json",
         "-o", str(out_path),
-        "--bot", args.token,
-    ] + since_arg + until_arg
+        "--after", iso(since_eff),
+        "--before", iso(until_eff),
+    ]
+    if args.verbose:
+        print("[info] Running exporter (token redacted):", " ".join([cmd[0]] + cmd[1:3] + ["***"] + cmd[4:]))
 
-    print("[info] Exporting:", " ".join(export_cmd))
-    r = subprocess.run(export_cmd, capture_output=True, text=True)
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if args.verbose:
+        sys.stdout.write(r.stdout)
     if r.returncode != 0:
-        print(r.stdout)
-        print(r.stderr, file=sys.stderr)
+        sys.stderr.write(r.stderr)
         print("[error] Export failed.", file=sys.stderr)
         sys.exit(r.returncode)
 
-    if not out_path.exists() or out_path.stat().st_size == 0:
-        print("[info] No messages exported in the window; nothing to forward.")
-        sys.exit(0)
-
-    # ---- Find max timestamp in the export
+    # Find latest message timestamp in the exported file
     latest_dt = find_latest_msg_ts_in_export(out_path)
-    if latest_dt is None:
+    if not latest_dt and args.verbose:
         print("[warn] Could not detect latest timestamp in export; forwarding anyway.")
 
-    # ---- Forward via your existing forwarder
-    # Choose per-channel state/id-map files so resume/quoting stay isolated
+    # Forward
     fwd_state = state_dir / f"forward_state_{args.channel}.json"
-    fwd_idmap = state_dir / f"id_map_{args.channel}.json"  # keep if your script supports --id-map
+    fwd_idmap = state_dir / f"id_map_{args.channel}.json"
 
     fwd_cmd = [
-        sys.executable,  str(forwarder_py),
+        sys.executable, str(forwarder_py),
         "--webhook", args.webhook,
-        "--json", str(out_path),        # <- was --input
-        "--state", str(fwd_state),      # <- REQUIRED by your forwarder
+        "--json", str(out_path),
+        "--state", str(fwd_state),
+        "--id-map", str(fwd_idmap),
         "--max-attach-mb", str(args.max_attach_mb),
         "--max-files-per-post", str(args.max_files_per_post),
     ]
+    if args.dry_run:
+        fwd_cmd.append("--dry-run")
+    if args.verbose:
+        fwd_cmd.append("--verbose")
 
-    # Only include if your forward_new.py supports it
-    if True:
-        fwd_cmd += ["--id-map", str(fwd_idmap)]
+    if args.verbose:
+        print("[info] Forwarding (webhook redacted):", " ".join(fwd_cmd[:3] + ["***"] + fwd_cmd[4:]))
 
-    print("[info] Forwarding:", " ".join(fwd_cmd))
     r2 = subprocess.run(fwd_cmd, capture_output=True, text=True)
-    print(r2.stdout)
+    sys.stdout.write(r2.stdout)
     if r2.returncode != 0:
-        print(r2.stderr, file=sys.stderr)
+        sys.stderr.write(r2.stderr)
         print("[error] Forwarding failed.", file=sys.stderr)
         sys.exit(r2.returncode)
 
-    # ---- Update state
-    if latest_dt:
-        save_state(state_dir, args.channel, iso(latest_dt))
-        print(f"[info] Updated state last_exported_iso = {iso(latest_dt)}")
+    # Update state (use actual latest if available, else until_eff)
+    final_dt = latest_dt or until_eff
+    save_state(state_dir, args.channel, iso(final_dt))
+    if args.verbose:
+        print(f"[info] Updated state last_exported_iso = {iso(final_dt)}")
 
     print("[done] Exported and forwarded once.")
 
